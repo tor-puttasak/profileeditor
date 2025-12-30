@@ -1,0 +1,576 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  signInAnonymously, 
+  onAuthStateChanged, 
+  signOut,
+  signInWithEmailAndPassword
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  getDocs, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  onSnapshot, 
+  query,
+  limit
+} from 'firebase/firestore';
+import { 
+  Camera, 
+  Upload, 
+  Image as ImageIcon, 
+  Settings, 
+  Download, 
+  Trash2, 
+  Plus, 
+  LogOut, 
+  LogIn, 
+  RefreshCw, 
+  ChevronRight,
+  User,
+  LayoutGrid,
+  X,
+  PlusCircle,
+  Edit2,
+  Check,
+  History
+} from 'lucide-react';
+
+// --- Configuration & Initialization ---
+const firebaseConfig = {
+  apiKey: "AIzaSyCJpBsxX2fGmch1eQZzJvXCzUOklhaDcrI",
+  authDomain: "imageedit-f1e2d.firebaseapp.com",
+  projectId: "imageedit-f1e2d",
+  storageBucket: "imageedit-f1e2d.firebasestorage.app",
+  messagingSenderId: "401063870366",
+  appId: "1:401063870366:web:0999032a6366988672608f",
+  measurementId: "G-NMB760T4ZS"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'image-stylizer-app';
+const apiKey = ""; // Provided by environment
+
+// --- AI API Helper ---
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const callGeminiImageToImage = async (base64Image, prompt) => {
+  // ใช้โมเดล gemini-2.5-flash-image-preview สำหรับการตกแต่งภาพโดยเฉพาะ
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`;
+  const payload = {
+    contents: [{
+      parts: [
+        { text: `Apply this style or instruction to the image: ${prompt}` },
+        { inlineData: { mimeType: "image/png", data: base64Image.split(',')[1] } }
+      ]
+    }],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+  };
+
+  for (let i = 0; i < 5; i++) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) throw new Error('API failed');
+      const result = await response.json();
+      const base64 = result.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+      if (base64) return `data:image/png;base64,${base64}`;
+      throw new Error('No image result');
+    } catch (error) {
+      if (i === 4) throw error;
+      await sleep(Math.pow(2, i) * 1000);
+    }
+  }
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('home'); 
+  const [presets, setPresets] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [resultImage, setResultImage] = useState(null);
+  const [customPrompt, setCustomPrompt] = useState("");
+  const [selectedPreset, setSelectedPreset] = useState(null);
+  const [statusMessage, setStatusMessage] = useState("");
+  
+  // Admin Editing States
+  const [editingPresetId, setEditingPresetId] = useState(null);
+  const [editForm, setEditForm] = useState({ name: "", prompt: "" });
+
+  // Camera States
+  const [showCamera, setShowCamera] = useState(false);
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [stream, setStream] = useState(null);
+  const fileInputRef = useRef(null);
+
+  // 1. Auth & Data Init
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          try {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } catch (tokenErr) {
+            await signInAnonymously(auth);
+          }
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth initialization failed:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    // Fetch Presets แบบ Real-time
+    const presetsRef = collection(db, 'artifacts', appId, 'public', 'data', 'presets');
+    const unsubscribePresets = onSnapshot(presetsRef, (snapshot) => {
+      const p = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // Seed ข้อมูลเริ่มต้น 5 แบบถ้าฐานข้อมูลว่าง
+      if (p.length === 0) {
+        const defaults = [
+          { name: "Cyberpunk", prompt: "Cyberpunk neon city style, futuristic, high contrast, glowing lights" },
+          { name: "Watercolor", prompt: "Soft watercolor painting, artistic brush strokes, pastel colors, fluid" },
+          { name: "Oil Painting", prompt: "Classic oil painting style, thick texture, artistic, vivid colors" },
+          { name: "Anime", prompt: "High quality anime style, studio ghibli aesthetics, vibrant" },
+          { name: "Sketch", prompt: "Detailed charcoal pencil sketch, black and white, hand-drawn" }
+        ];
+        defaults.forEach(d => addDoc(presetsRef, d));
+      }
+      setPresets(p);
+    });
+
+    // Fetch History
+    const historyRef = collection(db, 'artifacts', appId, 'public', 'data', 'history');
+    const unsubscribeHistory = onSnapshot(historyRef, (snapshot) => {
+      const h = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setHistory(h.sort((a, b) => b.createdAt - a.createdAt));
+    });
+
+    return () => {
+      unsubscribePresets();
+      unsubscribeHistory();
+    };
+  }, [user]);
+
+  // --- Camera Functions ---
+  useEffect(() => {
+    let currentStream = null;
+    const initCamera = async () => {
+      if (showCamera) {
+        try {
+          currentStream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: 'user', width: { ideal: 1024 }, height: { ideal: 1024 } }, 
+            audio: false 
+          });
+          setStream(currentStream);
+          if (videoRef.current) videoRef.current.srcObject = currentStream;
+        } catch (err) {
+          setStatusMessage("Camera Error: " + err.message);
+          setShowCamera(false);
+        }
+      }
+    };
+    initCamera();
+    return () => { if (currentStream) currentStream.getTracks().forEach(t => t.stop()); };
+  }, [showCamera]);
+
+  const capturePhoto = () => {
+    if (videoRef.current && canvasRef.current) {
+      const canvas = canvasRef.current;
+      const video = videoRef.current;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0);
+      setSelectedImage(canvas.toDataURL('image/png'));
+      closeCamera();
+    }
+  };
+
+  const closeCamera = () => {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    setStream(null);
+    setShowCamera(false);
+  };
+
+  const handleProcessImage = async () => {
+    if (!selectedImage) return;
+    const promptToUse = customPrompt || selectedPreset?.prompt;
+    if (!promptToUse) {
+      setStatusMessage("โปรดเลือกสไตล์หรือใส่ Prompt");
+      return;
+    }
+
+    setLoading(true);
+    setStatusMessage("AI กำลังสร้างสรรค์ภาพ...");
+    try {
+      const result = await callGeminiImageToImage(selectedImage, promptToUse);
+      setResultImage(result);
+      if (user) {
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'history'), {
+          imageUrl: result,
+          prompt: promptToUse,
+          createdAt: Date.now(),
+          createdBy: user.uid
+        });
+      }
+      setStatusMessage("ตกแต่งภาพสำเร็จ!");
+    } catch (error) {
+      setStatusMessage("เกิดข้อผิดพลาดในการสร้างภาพ");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- Admin Logic ---
+  const handleAddPreset = async (e) => {
+    e.preventDefault();
+    const name = e.target.name.value;
+    const prompt = e.target.prompt.value;
+    if (!name || !prompt) return;
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'presets'), { name, prompt });
+    e.target.reset();
+  };
+
+  const handleDeletePreset = async (id) => {
+    await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'presets', id));
+  };
+
+  const startEditPreset = (p) => {
+    setEditingPresetId(p.id);
+    setEditForm({ name: p.name, prompt: p.prompt });
+  };
+
+  const saveEditPreset = async (id) => {
+    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'presets', id), {
+      name: editForm.name,
+      prompt: editForm.prompt
+    });
+    setEditingPresetId(null);
+  };
+
+  const isAdmin = user && !user.isAnonymous;
+
+  // --- Views ---
+  const HomeView = () => (
+    <div className="max-w-5xl mx-auto space-y-8 animate-in fade-in duration-500">
+      <header className="text-center space-y-3">
+        <h1 className="text-6xl font-black bg-clip-text text-transparent bg-gradient-to-r from-purple-400 via-pink-500 to-orange-500">
+          STYLIZER AI
+        </h1>
+        <p className="text-slate-400 text-lg">ตกแต่งภาพถ่ายด้วยสไตล์ที่คุณกำหนดเอง</p>
+      </header>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
+        {/* Source Image Panel */}
+        <div className="bg-slate-900/40 backdrop-blur-xl p-8 rounded-[2.5rem] border border-white/10 shadow-2xl space-y-6">
+          <div className="flex justify-between items-center">
+            <h2 className="text-xl font-bold flex items-center gap-3">
+              <ImageIcon className="w-6 h-6 text-purple-400" /> รูปภาพของคุณ
+            </h2>
+            <div className="flex gap-3">
+              <button onClick={() => setShowCamera(true)} className="p-3 bg-purple-500/20 hover:bg-purple-500/40 rounded-2xl text-purple-400 transition-all">
+                <Camera className="w-6 h-6" />
+              </button>
+              <button onClick={() => fileInputRef.current?.click()} className="p-3 bg-blue-500/20 hover:bg-blue-500/40 rounded-2xl text-blue-400 transition-all">
+                <Upload className="w-6 h-6" />
+              </button>
+            </div>
+          </div>
+
+          <div className="aspect-square w-full bg-slate-950 rounded-3xl border-2 border-dashed border-white/5 flex items-center justify-center overflow-hidden relative group">
+            {selectedImage ? (
+              <>
+                <img src={selectedImage} className="w-full h-full object-cover" alt="Source" />
+                <button onClick={() => setSelectedImage(null)} className="absolute top-4 right-4 p-3 bg-red-500/90 rounded-2xl opacity-0 group-hover:opacity-100 transition-all">
+                  <Trash2 className="w-5 h-5 text-white" />
+                </button>
+              </>
+            ) : (
+              <div className="text-center space-y-4 p-10">
+                <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto">
+                  <Camera className="w-10 h-10 text-slate-700" />
+                </div>
+                <p className="text-slate-500 font-medium">เริ่มต้นด้วยการถ่ายภาพหรืออัปโหลด</p>
+              </div>
+            )}
+          </div>
+          <input type="file" ref={fileInputRef} onChange={(e) => {
+            const file = e.target.files[0];
+            if (file) {
+              const r = new FileReader();
+              r.onload = () => setSelectedImage(r.result);
+              r.readAsDataURL(file);
+            }
+          }} accept="image/*" className="hidden" />
+        </div>
+
+        {/* Style Selection Panel */}
+        <div className="bg-slate-900/40 backdrop-blur-xl p-8 rounded-[2.5rem] border border-white/10 shadow-2xl flex flex-col justify-between min-h-full">
+          <div className="space-y-8">
+            <h2 className="text-xl font-bold flex items-center gap-3">
+              <LayoutGrid className="w-6 h-6 text-pink-400" /> สไตล์ที่พร้อมใช้งาน
+            </h2>
+            
+            <div className="grid grid-cols-2 gap-3">
+              {presets.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => { setSelectedPreset(p); setCustomPrompt(""); }}
+                  className={`p-4 rounded-2xl border text-sm font-bold transition-all text-center ${
+                    selectedPreset?.id === p.id 
+                      ? 'bg-purple-600 border-purple-400 shadow-[0_0_20px_rgba(168,85,247,0.4)] scale-105' 
+                      : 'bg-slate-950/50 border-white/5 hover:border-white/20'
+                  }`}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+
+            <div className="space-y-3">
+              <label className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em]">หรือระบุสไตล์เอง (Custom Prompt)</label>
+              <textarea 
+                value={customPrompt}
+                onChange={(e) => { setCustomPrompt(e.target.value); setSelectedPreset(null); }}
+                placeholder="พิมพ์สไตล์ที่คุณจินตนาการไว้ที่นี่..."
+                className="w-full bg-slate-950 rounded-2xl p-4 text-sm border border-white/5 focus:border-purple-500 outline-none h-28 resize-none transition-all focus:ring-4 focus:ring-purple-500/10"
+              />
+            </div>
+          </div>
+
+          <button 
+            disabled={loading || !selectedImage}
+            onClick={handleProcessImage}
+            className={`w-full py-5 rounded-2xl font-black text-lg flex items-center justify-center gap-3 transition-all mt-8 ${
+              loading || !selectedImage 
+                ? 'bg-slate-800 text-slate-600 cursor-not-allowed opacity-50' 
+                : 'bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 hover:scale-[1.02] active:scale-[0.98] shadow-2xl shadow-purple-600/20'
+            }`}
+          >
+            {loading ? <RefreshCw className="w-6 h-6 animate-spin" /> : <ChevronRight className="w-6 h-6" />}
+            {loading ? "AI กำลังประมวลผล..." : "ตกแต่งภาพทันที"}
+          </button>
+        </div>
+      </div>
+
+      {resultImage && (
+        <div className="bg-slate-900/60 backdrop-blur-2xl p-10 rounded-[3rem] border-2 border-purple-500/20 shadow-2xl animate-in slide-in-from-bottom-10 duration-700">
+          <div className="flex flex-col lg:flex-row gap-12 items-center">
+            <div className="w-full lg:w-1/2 aspect-square bg-black rounded-3xl overflow-hidden shadow-2xl ring-8 ring-purple-500/10">
+              <img src={resultImage} className="w-full h-full object-contain" alt="Result" />
+            </div>
+            <div className="w-full lg:w-1/2 space-y-8 text-center lg:text-left">
+              <h3 className="text-4xl font-black mb-4">ได้รูปใหม่แล้ว!</h3>
+              <p className="text-slate-400 text-lg">ตกแต่งเสร็จสมบูรณ์ตามความต้องการของคุณ</p>
+              <button 
+                onClick={() => {
+                  const link = document.createElement('a');
+                  link.href = resultImage;
+                  link.download = `stylizer-${Date.now()}.png`;
+                  link.click();
+                }}
+                className="w-full py-5 bg-white text-black rounded-2xl font-black text-lg flex items-center justify-center gap-3 hover:bg-slate-200 transition-all shadow-xl"
+              >
+                <Download className="w-6 h-6" /> ดาวน์โหลดรูปภาพ
+              </button>
+              <button onClick={() => setResultImage(null)} className="text-slate-500 hover:text-white block w-full text-center">ตกแต่งภาพอื่น</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {statusMessage && (
+        <div className="text-center py-4">
+          <span className="px-6 py-2 bg-purple-500/10 border border-purple-500/20 rounded-full text-purple-400 font-bold text-sm">
+            {statusMessage}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white font-sans selection:bg-purple-500/30 overflow-x-hidden">
+      <nav className="relative z-50 px-8 py-6 flex justify-between items-center max-w-7xl mx-auto">
+        <div className="flex items-center gap-3 cursor-pointer group" onClick={() => setView('home')}>
+          <div className="w-12 h-12 bg-gradient-to-tr from-purple-600 to-orange-500 rounded-2xl flex items-center justify-center shadow-2xl group-hover:rotate-12 transition-all">
+            <ImageIcon className="w-7 h-7 text-white" />
+          </div>
+          <span className="font-black text-2xl tracking-tighter uppercase">Stylizer</span>
+        </div>
+
+        <div className="flex items-center gap-4 bg-white/5 backdrop-blur-md p-1 rounded-2xl border border-white/5">
+          {isAdmin ? (
+            <>
+              <button onClick={() => setView('admin')} className={`px-5 py-2 rounded-xl text-sm font-bold transition-all ${view === 'admin' ? 'bg-white text-black' : 'hover:bg-white/5'}`}>Manage Presets</button>
+              <button onClick={() => setView('gallery')} className={`px-5 py-2 rounded-xl text-sm font-bold transition-all ${view === 'gallery' ? 'bg-white text-black' : 'hover:bg-white/5'}`}>History Gallery</button>
+              <button onClick={() => signOut(auth)} className="p-2 text-red-400"><LogOut className="w-5 h-5" /></button>
+            </>
+          ) : (
+            <button onClick={() => setView('login')} className="flex items-center gap-2 px-6 py-2 rounded-xl text-sm font-bold hover:bg-white/5 transition-all">
+              <User className="w-4 h-4" /> Admin Login
+            </button>
+          )}
+        </div>
+      </nav>
+
+      <main className="relative z-10 container mx-auto px-4 py-8">
+        {view === 'home' && <HomeView />}
+        
+        {view === 'login' && (
+          <div className="max-w-md mx-auto mt-20 bg-slate-900/50 backdrop-blur-2xl p-10 rounded-[2.5rem] border border-white/10 shadow-2xl space-y-8">
+            <h2 className="text-3xl font-black text-center">Admin Login</h2>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                await signInWithEmailAndPassword(auth, e.target.email.value, e.target.password.value);
+                setView('admin');
+              } catch (err) { setStatusMessage("รหัสผ่านไม่ถูกต้อง"); }
+            }} className="space-y-4">
+              <input name="email" type="email" placeholder="Email" className="w-full bg-slate-950 border border-white/5 rounded-2xl p-4 outline-none focus:border-purple-500" required />
+              <input name="password" type="password" placeholder="Password" className="w-full bg-slate-950 border border-white/5 rounded-2xl p-4 outline-none focus:border-purple-500" required />
+              <button className="w-full bg-white text-black py-4 rounded-2xl font-black text-lg">Sign In</button>
+            </form>
+          </div>
+        )}
+
+        {view === 'admin' && isAdmin && (
+          <div className="max-w-4xl mx-auto space-y-12">
+            <div className="bg-slate-900/40 p-10 rounded-[2.5rem] border border-white/10 space-y-8 shadow-2xl">
+              <h2 className="text-3xl font-black flex items-center gap-4"><Settings className="text-purple-500" /> จัดการสไตล์ภาพ (Presets)</h2>
+              <form onSubmit={handleAddPreset} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <input name="name" placeholder="ชื่อสไตล์ (เช่น 80s Retro)" className="bg-slate-950 border border-white/5 p-4 rounded-2xl outline-none focus:border-purple-500" required />
+                <input name="prompt" placeholder="AI Prompt สำหรับสไตล์นี้" className="bg-slate-950 border border-white/5 p-4 rounded-2xl outline-none focus:border-purple-500" required />
+                <button className="md:col-span-2 bg-purple-600 py-4 rounded-2xl font-black flex items-center justify-center gap-2 hover:bg-purple-500 transition-all">
+                  <PlusCircle className="w-5 h-5" /> เพิ่มสไตล์ใหม่
+                </button>
+              </form>
+            </div>
+            
+            <div className="space-y-4">
+              <h3 className="text-xl font-bold px-2">สไตล์ทั้งหมดที่มีในระบบ</h3>
+              <div className="grid grid-cols-1 gap-4">
+                {presets.map(p => (
+                  <div key={p.id} className="bg-slate-900/40 p-6 rounded-3xl flex flex-col md:flex-row justify-between items-start md:items-center border border-white/5 gap-4">
+                    {editingPresetId === p.id ? (
+                      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
+                        <input 
+                          value={editForm.name} 
+                          onChange={e => setEditForm({...editForm, name: e.target.value})}
+                          className="bg-slate-950 border border-purple-500 p-3 rounded-xl outline-none" 
+                        />
+                        <input 
+                          value={editForm.prompt} 
+                          onChange={e => setEditForm({...editForm, prompt: e.target.value})}
+                          className="bg-slate-950 border border-purple-500 p-3 rounded-xl outline-none" 
+                        />
+                      </div>
+                    ) : (
+                      <div className="space-y-1">
+                        <p className="font-black text-xl text-white">{p.name}</p>
+                        <p className="text-sm text-slate-500 italic line-clamp-1">{p.prompt}</p>
+                      </div>
+                    )}
+                    
+                    <div className="flex gap-2 w-full md:w-auto">
+                      {editingPresetId === p.id ? (
+                        <button onClick={() => saveEditPreset(p.id)} className="p-3 bg-green-500/20 text-green-400 rounded-xl hover:bg-green-500/30 transition-all flex-1 md:flex-none">
+                          <Check className="w-5 h-5 mx-auto" />
+                        </button>
+                      ) : (
+                        <button onClick={() => startEditPreset(p)} className="p-3 bg-blue-500/20 text-blue-400 rounded-xl hover:bg-blue-500/30 transition-all flex-1 md:flex-none">
+                          <Edit2 className="w-5 h-5 mx-auto" />
+                        </button>
+                      )}
+                      <button onClick={() => handleDeletePreset(p.id)} className="p-3 bg-red-500/20 text-red-500 rounded-xl hover:bg-red-500/30 transition-all flex-1 md:flex-none">
+                        <Trash2 className="w-5 h-5 mx-auto" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {view === 'gallery' && isAdmin && (
+          <div className="max-w-7xl mx-auto space-y-8">
+            <h2 className="text-3xl font-black flex items-center gap-4"><History className="text-orange-500" /> แกลเลอรี่รวมผลงาน</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
+              {history.map(item => (
+                <div key={item.id} className="group relative bg-slate-900 rounded-[2rem] overflow-hidden border border-white/5 aspect-square">
+                  <img src={item.imageUrl} className="w-full h-full object-cover transition-all duration-500 group-hover:scale-110" alt="History" />
+                  <div className="absolute inset-0 bg-black/80 opacity-0 group-hover:opacity-100 transition-all p-4 flex flex-col justify-end gap-2">
+                    <button onClick={() => {
+                      const link = document.createElement('a');
+                      link.href = item.imageUrl;
+                      link.download = `history-${item.id}.png`;
+                      link.click();
+                    }} className="w-full bg-white text-black p-3 rounded-xl flex items-center justify-center gap-2 font-bold text-xs">
+                      <Download className="w-4 h-4" /> Save
+                    </button>
+                    <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'history', item.id))} className="w-full bg-red-500/20 text-red-400 p-3 rounded-xl flex items-center justify-center gap-2 font-bold text-xs">
+                      <Trash2 className="w-4 h-4" /> Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Camera UI */}
+      {showCamera && (
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-black/95 p-6 animate-in fade-in duration-300">
+          <div className="relative w-full max-w-2xl bg-slate-900 rounded-[3rem] overflow-hidden border border-white/10 shadow-[0_0_80px_rgba(168,85,247,0.3)]">
+            <div className="absolute top-6 right-6 z-50">
+              <button onClick={closeCamera} className="p-4 bg-white/10 hover:bg-white/20 rounded-full text-white backdrop-blur-xl transition-all">
+                <X className="w-8 h-8" />
+              </button>
+            </div>
+            <video ref={videoRef} autoPlay playsInline className="w-full aspect-square object-cover" style={{ transform: 'scaleX(-1)' }} />
+            <canvas ref={canvasRef} className="hidden" />
+            <div className="absolute bottom-10 left-0 right-0 flex justify-center">
+              <button onClick={capturePhoto} className="w-24 h-24 bg-white rounded-full flex items-center justify-center shadow-2xl ring-[12px] ring-white/10 active:scale-90 transition-all">
+                <div className="w-16 h-16 rounded-full border-[6px] border-slate-950" />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <footer className="relative z-10 py-16 border-t border-white/5 mt-20 opacity-30 text-center text-[10px] tracking-[0.3em] uppercase">
+        <p>© 2025 STYLIZER AI • INNOVATION HUB</p>
+      </footer>
+    </div>
+  );
+}
