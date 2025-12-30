@@ -220,27 +220,50 @@ export default function App() {
     setShowCamera(false);
   };
 
-  const handleProcessImage = async () => {
-    if (!selectedImage) return;
+  // --- Image Processing Helper Functions ---
+  const validateProcessingInputs = () => {
+    if (!selectedImage) return { valid: false, error: null };
+
     const promptToUse = customPrompt || selectedPreset?.prompt;
     if (!promptToUse) {
-      setStatusMessage("โปรดเลือกสไตล์หรือใส่ Prompt");
+      return { valid: false, error: "โปรดเลือกสไตล์หรือใส่ Prompt" };
+    }
+
+    return { valid: true, prompt: promptToUse };
+  };
+
+  const saveToHistory = async (imageUrl, prompt) => {
+    if (!user) return;
+
+    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'history'), {
+      imageUrl,
+      prompt,
+      createdAt: Date.now(),
+      createdBy: user.uid
+    });
+  };
+
+  const downloadImage = (imageUrl, filename) => {
+    const link = document.createElement('a');
+    link.href = imageUrl;
+    link.download = filename;
+    link.click();
+  };
+
+  const handleProcessImage = async () => {
+    const validation = validateProcessingInputs();
+    if (!validation.valid) {
+      if (validation.error) setStatusMessage(validation.error);
       return;
     }
 
     setLoading(true);
     setStatusMessage("AI กำลังสร้างสรรค์ภาพ...");
+
     try {
-      const result = await callGeminiImageToImage(selectedImage, promptToUse);
+      const result = await callGeminiImageToImage(selectedImage, validation.prompt);
       setResultImage(result);
-      if (user) {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'history'), {
-          imageUrl: result,
-          prompt: promptToUse,
-          createdAt: Date.now(),
-          createdBy: user.uid
-        });
-      }
+      await saveToHistory(result, validation.prompt);
       setStatusMessage("ตกแต่งภาพสำเร็จ!");
     } catch (error) {
       setStatusMessage("เกิดข้อผิดพลาดในการสร้างภาพ");
@@ -390,13 +413,8 @@ export default function App() {
             <div className="w-full lg:w-1/2 space-y-8 text-center lg:text-left">
               <h3 className="text-4xl font-black mb-4">ได้รูปใหม่แล้ว!</h3>
               <p className="text-slate-400 text-lg">ตกแต่งเสร็จสมบูรณ์ตามความต้องการของคุณ</p>
-              <button 
-                onClick={() => {
-                  const link = document.createElement('a');
-                  link.href = resultImage;
-                  link.download = `stylizer-${Date.now()}.png`;
-                  link.click();
-                }}
+              <button
+                onClick={() => downloadImage(resultImage, `stylizer-${Date.now()}.png`)}
                 className="w-full py-5 bg-white text-black rounded-2xl font-black text-lg flex items-center justify-center gap-3 hover:bg-slate-200 transition-all shadow-xl"
               >
                 <Download className="w-6 h-6" /> ดาวน์โหลดรูปภาพ
@@ -529,12 +547,10 @@ export default function App() {
                 <div key={item.id} className="group relative bg-slate-900 rounded-[2rem] overflow-hidden border border-white/5 aspect-square">
                   <img src={item.imageUrl} className="w-full h-full object-cover transition-all duration-500 group-hover:scale-110" alt="History" />
                   <div className="absolute inset-0 bg-black/80 opacity-0 group-hover:opacity-100 transition-all p-4 flex flex-col justify-end gap-2">
-                    <button onClick={() => {
-                      const link = document.createElement('a');
-                      link.href = item.imageUrl;
-                      link.download = `history-${item.id}.png`;
-                      link.click();
-                    }} className="w-full bg-white text-black p-3 rounded-xl flex items-center justify-center gap-2 font-bold text-xs">
+                    <button
+                      onClick={() => downloadImage(item.imageUrl, `history-${item.id}.png`)}
+                      className="w-full bg-white text-black p-3 rounded-xl flex items-center justify-center gap-2 font-bold text-xs"
+                    >
                       <Download className="w-4 h-4" /> Save
                     </button>
                     <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'history', item.id))} className="w-full bg-red-500/20 text-red-400 p-3 rounded-xl flex items-center justify-center gap-2 font-bold text-xs">
